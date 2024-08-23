@@ -33,16 +33,20 @@ class GooglePhotosExif extends Command {
       description: 'Directory for any files that have bad EXIF data - including the matching metadata files',
       required: true,
     }),
+    skipCopied: flags.boolean({
+      char: 's',
+      description: 'If a file with the same name already exists in the output directory, it will be skipped.'
+    }),
   }
 
   static args: Parser.args.Input  = []
 
   async run() {
     const { args, flags} = this.parse(GooglePhotosExif);
-    const { inputDir, outputDir, errorDir } = flags;
+    const { inputDir, outputDir, errorDir, skipCopied } = flags;
 
     try {
-      const directories = this.determineDirectoryPaths(inputDir, outputDir, errorDir);
+      const directories = this.determineDirectoryPaths(inputDir, outputDir, errorDir, skipCopied);
       await this.prepareDirectories(directories);
       await this.processMediaFiles(directories);
     } catch (error) {
@@ -54,11 +58,12 @@ class GooglePhotosExif extends Command {
     this.exit(0);
   }
 
-  private determineDirectoryPaths(inputDir: string, outputDir: string, errorDir: string): Directories {
+  private determineDirectoryPaths(inputDir: string, outputDir: string, errorDir: string, skipCopied: Boolean): Directories {
     return {
       input: inputDir,
       output: outputDir,
       error: errorDir,
+      skip: skipCopied,
     };
   }
 
@@ -75,8 +80,13 @@ class GooglePhotosExif extends Command {
       throw new Error('You must specify an error directory using the --errorDir flag');
     }
 
-    await this.checkDirIsEmptyAndCreateDirIfNotFound(directories.output, 'If the output directory already exists, it must be empty');
-    await this.checkDirIsEmptyAndCreateDirIfNotFound(directories.error, 'If the error directory already exists, it must be empty');
+    if (!directories.skip){
+      await this.checkDirIsEmptyAndCreateDirIfNotFound(directories.output, 'If the output directory already exists, it must be empty');
+    }
+
+    if (!directories.skip){
+      await this.checkDirIsEmptyAndCreateDirIfNotFound(directories.error, 'If the error directory already exists, it must be empty');
+    }
   }
 
   private async checkDirIsEmptyAndCreateDirIfNotFound(directoryPath: string, messageIfNotEmpty: string): Promise<void> {
@@ -116,33 +126,34 @@ class GooglePhotosExif extends Command {
     const fileNamesWithEditedExif: string[] = [];
 
     for (let i = 0, mediaFile; mediaFile = mediaFiles[i]; i++) {
+        if (!directories.skip || !existsSync(mediaFile.outputFilePath)) {
+          // Copy the file into output directory
+          this.log(`Copying file ${i} of ${mediaFiles.length}: ${mediaFile.mediaFilePath} -> ${mediaFile.outputFileName}`);
 
-      // Copy the file into output directory
-      this.log(`Copying file ${i} of ${mediaFiles.length}: ${mediaFile.mediaFilePath} -> ${mediaFile.outputFileName}`);
+          // If album dir is not created, create it
 
-      // If album dir is not created, create it
+          if (!existsSync(mediaFile.albumPath)) {
+            await mkdir(mediaFile.albumPath);
+            this.log(`--- Creating directory: ${mediaFile.albumPath} ---`);
+          }
+          await copyFile(mediaFile.mediaFilePath, mediaFile.outputFilePath);
 
-      if (!existsSync(mediaFile.albumPath)) {
-        await mkdir(mediaFile.albumPath);
-        this.log(`--- Creating directory: ${mediaFile.albumPath} ---`);
-      }
-      await copyFile(mediaFile.mediaFilePath, mediaFile.outputFilePath);
+          // Process the output file, setting the modified timestamp and/or EXIF metadata where necessary
+          const photoTimeTaken = await readPhotoTakenTimeFromGoogleJson(mediaFile);
 
-      // Process the output file, setting the modified timestamp and/or EXIF metadata where necessary
-      const photoTimeTaken = await readPhotoTakenTimeFromGoogleJson(mediaFile);
+          if (photoTimeTaken) {
+            if (mediaFile.supportsExif) {
+              const hasExifDate = await doesFileHaveExifDate(mediaFile.mediaFilePath);
+              if (!hasExifDate) {
+                await updateExifMetadata(mediaFile, photoTimeTaken, directories.error);
+                fileNamesWithEditedExif.push(mediaFile.outputFileName);
+                this.log(`Wrote "DateTimeOriginal" EXIF metadata to: ${mediaFile.outputFileName}`);
+              }
+            }
 
-      if (photoTimeTaken) {
-        if (mediaFile.supportsExif) {
-          const hasExifDate = await doesFileHaveExifDate(mediaFile.mediaFilePath);
-          if (!hasExifDate) {
-            await updateExifMetadata(mediaFile, photoTimeTaken, directories.error);
-            fileNamesWithEditedExif.push(mediaFile.outputFileName);
-            this.log(`Wrote "DateTimeOriginal" EXIF metadata to: ${mediaFile.outputFileName}`);
+            await updateFileModificationDate(mediaFile.outputFilePath, photoTimeTaken);
           }
         }
-
-        await updateFileModificationDate(mediaFile.outputFilePath, photoTimeTaken);
-      }
     }
 
     // Log a summary
